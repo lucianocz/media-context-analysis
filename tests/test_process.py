@@ -279,23 +279,26 @@ def test_slow_audio_callback_times_out_without_a_leftover_process() -> None:
 def test_slow_audio_callback_can_be_cancelled() -> None:
     ffmpeg = _ffmpeg()
     cancel = threading.Event()
+    seen = 0
 
-    def trip() -> None:
-        time.sleep(0.2)
+    def on_chunk(block: bytes) -> None:
+        nonlocal seen
+        del block
+        seen += 1
         cancel.set()
-
-    threading.Thread(target=trip, daemon=True).start()
+        time.sleep(0.05)
 
     def action() -> None:
         stream_chunks(
             _audio_command(ffmpeg),
-            on_chunk=_pause,
+            on_chunk=on_chunk,
             deadline=None,
             cancel_event=cancel,
         )
 
     error = _call_in_thread(action, 2.5)
     assert isinstance(error, AnalysisCancelledError)
+    assert seen >= 1
 
 
 def test_concurrent_visual_streams_stop_on_timeout_and_cancel() -> None:

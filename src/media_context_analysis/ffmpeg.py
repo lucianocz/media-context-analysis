@@ -685,7 +685,12 @@ def process_alive(pid: int) -> bool:
 def _windows_process_alive(pid: int) -> bool:
     import ctypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # WinDLL and get_last_error exist on Windows. Linux type stubs omit them.
+    windll = getattr(ctypes, "WinDLL", None)
+    last_error = getattr(ctypes, "get_last_error", None)
+    if windll is None or last_error is None:
+        return False
+    kernel32 = windll("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
@@ -694,10 +699,10 @@ def _windows_process_alive(pid: int) -> bool:
     kernel32.CloseHandle.restype = ctypes.c_int
     handle = kernel32.OpenProcess(0x1000, 0, pid)
     if not handle:
-        return ctypes.get_last_error() == 5
+        return int(last_error()) == 5
     code = ctypes.c_ulong()
-    queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+    queried = int(kernel32.GetExitCodeProcess(handle, ctypes.byref(code)))
     kernel32.CloseHandle(handle)
     if not queried:
         return True
-    return code.value == 259
+    return int(code.value) == 259
