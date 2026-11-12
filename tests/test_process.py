@@ -380,3 +380,299 @@ def test_fast_visual_stream_still_completes() -> None:
     assert code == 0
     assert seen > 0
     assert _ffmpeg_pids() - before == set()
+
+
+def _wait_until(action: object, seconds: float = 5) -> None:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if action():  # type: ignore[operator]
+            return
+        time.sleep(0.02)
+    assert action()  # type: ignore[operator]
+
+
+def _running(pid: int) -> bool:
+    # Orphaned Unix zombies retain a PID but cannot execute or hold pipes.
+    if sys.platform != "win32":
+        from pathlib import Path
+
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists() and stat.read_text().split(") ", 1)[1].startswith("Z"):
+            return False
+    return process_alive(pid)
+
+
+@pytest.mark.parametrize("leader_exits", [False, True])
+def test_cleanup_kills_owned_descendants_only(tmp_path: object, leader_exits: bool) -> None:
+    from pathlib import Path
+
+    record = Path(str(tmp_path)) / "descendant.pid"
+    child = "import time; time.sleep(30)"
+    script = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r}]); "
+        f"Path({str(record)!r}).write_text(str(p.pid)); "
+        + ("" if leader_exits else "time.sleep(30)")
+    )
+    outsider = subprocess.Popen([sys.executable, "-c", child])
+    try:
+        if leader_exits:
+            run_bounded([sys.executable, "-c", script], deadline=None, cancel_event=None)
+        else:
+            with pytest.raises(AnalysisTimeoutError):
+                run_bounded(
+                    [sys.executable, "-c", script], deadline=None, cancel_event=None, timeout_s=0.5
+                )
+        pid = int(record.read_text())
+        _wait_until(lambda: not _running(pid))
+        assert outsider.poll() is None
+    finally:
+        outsider.kill()
+        outsider.wait(timeout=5)
+
+
+def test_exception_in_queued_consumer_cleans_up(tmp_path: object) -> None:
+    from pathlib import Path
+
+    record = Path(str(tmp_path)) / "producer.pid"
+    script = (
+        "import os,sys,time; from pathlib import Path; "
+        f"Path({str(record)!r}).write_text(str(os.getpid())); "
+        "sys.stdout.buffer.write(b'x'*1000000);sys.stdout.flush();time.sleep(30)"
+    )
+
+    def fail(block: bytes) -> None:
+        raise RuntimeError("consumer failed")
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        stream_chunks(
+            [sys.executable, "-c", script], on_chunk=fail, deadline=None, cancel_event=None
+        )
+    assert not _running(int(record.read_text()))
+
+
+def test_cancel_kills_producer_while_consumer_is_busy(tmp_path: object) -> None:
+    from pathlib import Path
+
+    record = Path(str(tmp_path)) / "producer.pid"
+    script = (
+        "import os,sys,time; from pathlib import Path; "
+        f"Path({str(record)!r}).write_text(str(os.getpid())); "
+        "sys.stdout.buffer.write(b'x'*1000000);sys.stdout.flush();time.sleep(30)"
+    )
+    cancel = threading.Event()
+
+    def slow(block: bytes) -> None:
+        cancel.set()
+        pid = int(record.read_text())
+        _wait_until(lambda: not _running(pid), seconds=2)
+
+    with pytest.raises(AnalysisCancelledError):
+        stream_chunks(
+            [sys.executable, "-c", script], on_chunk=slow, deadline=None, cancel_event=cancel
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object host-death guarantee")
+def test_windows_host_death_kills_tree_and_nested_jobs_work(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from media_context_analysis.ffmpeg import _popen, _stop
+
+    record = Path(str(tmp_path)) / "descendant.pid"
+    child = "import time; time.sleep(30)"
+    script = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r}]); "
+        f"Path({str(record)!r}).write_text(str(p.pid)); time.sleep(30)"
+    )
+    host_script = (
+        "import sys; from media_context_analysis.ffmpeg import run_bounded; "
+        f"run_bounded([sys.executable,'-c',{script!r}], deadline=None, cancel_event=None)"
+    )
+    # The host itself is inside an owned job. Its subprocess creates a nested job.
+    host = _popen([sys.executable, "-c", host_script])
+    try:
+        _wait_until(record.exists)
+        pid = int(record.read_text())
+        assert _running(pid)
+        host.kill()  # abrupt termination, without Python finally or atexit
+        host.wait(timeout=5)
+        _wait_until(lambda: not _running(pid))
+    finally:
+        _stop(host)
+
+
+def test_reader_accepts_partial_unbuffered_frame_reads() -> None:
+    frames: list[bytes] = []
+    script = (
+        "import sys,time; sys.stdout.buffer.write(b'ab');sys.stdout.flush();"
+        "time.sleep(.1);sys.stdout.buffer.write(b'cd');sys.stdout.flush()"
+    )
+    code, _ = stream_fixed_frames(
+        [sys.executable, "-c", script],
+        frame_bytes=4,
+        on_frame=frames.append,
+        deadline=None,
+        cancel_event=None,
+    )
+    assert code == 0
+    assert frames == [b"abcd"]
+
+
+def test_worker_start_failure_does_not_leak_process_or_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import media_context_analysis.ffmpeg as execution
+
+    original = execution._popen
+    owned: list[subprocess.Popen[bytes]] = []
+    before = set(execution._active)
+
+    def record(command: list[str]) -> subprocess.Popen[bytes]:
+        process = original(command)
+        owned.append(process)
+        return process
+
+    def fail_start(thread: threading.Thread) -> None:
+        raise RuntimeError("worker unavailable")
+
+    monkeypatch.setattr(execution, "_popen", record)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="worker unavailable"):
+        run_bounded(
+            [sys.executable, "-c", "import time;time.sleep(30)"], deadline=None, cancel_event=None
+        )
+    assert execution._active == before
+    assert len(owned) == 1
+    assert not _running(owned[0].pid)
+
+
+@pytest.mark.parametrize("stage", ["version", "probe"])
+def test_cancellation_during_probing_stages(monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
+    from pathlib import Path
+
+    import media_context_analysis.ffmpeg as execution
+
+    cancel = threading.Event()
+    original = execution._popen
+    owned: list[subprocess.Popen[bytes]] = []
+
+    def replace(command: list[str]) -> subprocess.Popen[bytes]:
+        process = original([sys.executable, "-c", "import time;time.sleep(30)"])
+        owned.append(process)
+        cancel.set()
+        return process
+
+    monkeypatch.setattr(execution, "_popen", replace)
+    with pytest.raises(AnalysisCancelledError):
+        if stage == "version":
+            execution.tool_version("ffprobe", deadline=None, cancel_event=cancel)
+        else:
+            execution.probe_file(Path("input.mkv"), "ffprobe", deadline=None, cancel_event=cancel)
+    assert not _running(owned[0].pid)
+
+
+def test_run_bounded_preserves_large_stdout_and_stderr_exactly() -> None:
+    script = (
+        "import sys;sys.stdout.buffer.write(b'o'*2000000);sys.stderr.buffer.write(b'e'*2000000)"
+    )
+    code, stdout, stderr = run_bounded(
+        [sys.executable, "-c", script], deadline=time.monotonic() + 10, cancel_event=None
+    )
+    assert code == 0
+    assert stdout == b"o" * 2000000
+    assert stderr == b"e" * 2000000
+
+
+def test_normal_host_shutdown_cleans_up_active_process(tmp_path: object) -> None:
+    from pathlib import Path
+
+    record = Path(str(tmp_path)) / "shutdown.pid"
+    script = (
+        "import os,time;from pathlib import Path;"
+        f"Path({str(record)!r}).write_text(str(os.getpid()));time.sleep(30)"
+    )
+    host_script = (
+        "import sys,threading,time;from pathlib import Path;"
+        "from media_context_analysis.ffmpeg import run_bounded;"
+        f"threading.Thread(target=lambda:run_bounded([sys.executable,'-c',{script!r}],"
+        "deadline=None,cancel_event=None),daemon=True).start();"
+        f"p=Path({str(record)!r});\n"
+        "while not p.exists():time.sleep(.01)\n"
+    )
+    host = subprocess.run([sys.executable, "-c", host_script], capture_output=True, timeout=10)
+    assert host.returncode == 0, host.stderr.decode()
+    _wait_until(lambda: not _running(int(record.read_text())))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows restricted parent Job Object")
+def test_windows_incompatible_parent_job_fails_before_child_runs(tmp_path: object) -> None:
+    from pathlib import Path
+
+    marker = Path(str(tmp_path)) / "uncontained.txt"
+    child = f"from pathlib import Path;Path({str(marker)!r}).write_text('ran')"
+    script = (
+        "import ctypes,sys;from ctypes import wintypes as w;"
+        "from media_context_analysis._process import _kernel,_check,_ExtendedLimit;"
+        "from media_context_analysis.ffmpeg import run_bounded;"
+        "from media_context_analysis.errors import FFmpegFailedError;"
+        "k=_kernel();j=k.CreateJobObjectW(None,None);_check(j);"
+        "limits=_ExtendedLimit();limits.basic.flags=8;limits.basic.active_processes=1;"
+        "_check(k.SetInformationJobObject(j,9,ctypes.byref(limits),ctypes.sizeof(limits)));"
+        "k.AssignProcessToJobObject.argtypes=(w.HANDLE,w.HANDLE);"
+        "k.AssignProcessToJobObject.restype=w.BOOL;"
+        "_check(k.AssignProcessToJobObject(j,w.HANDLE(-1)));\n"
+        "try:\n"
+        f" run_bounded([sys.executable,'-c',{child!r}],deadline=None,cancel_event=None)\n"
+        "except FFmpegFailedError:\n print('contained failure')\n"
+        "else:\n raise AssertionError('restricted creation unexpectedly succeeded')\n"
+    )
+    host = subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=10)
+    assert host.returncode == 0, host.stderr.decode()
+    assert host.stdout.strip() == b"contained failure"
+    assert not marker.exists()
+
+
+def test_concurrent_job_close_cannot_close_a_reused_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import media_context_analysis._process as ownership
+
+    closed: list[int] = []
+
+    class Kernel:
+        def CloseHandle(self, handle: int) -> None:
+            closed.append(handle)
+
+    monkeypatch.setattr(ownership, "_kernel", Kernel)
+    old = ownership.WindowsOwnedProcess.__new__(ownership.WindowsOwnedProcess)
+    new = ownership.WindowsOwnedProcess.__new__(ownership.WindowsOwnedProcess)
+    old._job_handle = 42
+    ownership._jobs.add(old)
+    first_closed = threading.Event()
+    release = threading.Event()
+    original = ownership._close_job
+
+    def pause_after_close(owner: object) -> None:
+        original(owner)
+        if threading.current_thread().name == "first-closer":
+            first_closed.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(ownership, "_close_job", pause_after_close)
+    worker = threading.Thread(target=old.close_job, name="first-closer")
+    worker.start()
+    try:
+        assert first_closed.wait(5)
+        new._job_handle = 42  # Windows may reuse the numeric handle immediately.
+        ownership._jobs.add(new)
+        old.close_job()
+        assert closed == [42]
+        assert new in ownership._jobs
+        assert new._job_handle == 42
+    finally:
+        release.set()
+        worker.join(5)
+        new.close_job()
+    assert closed == [42, 42]
+    assert old not in ownership._jobs
+    assert new not in ownership._jobs

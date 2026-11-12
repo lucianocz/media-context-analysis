@@ -28,63 +28,7 @@ GROUP_KINDS = frozenset({"brief_insert_return"})
 TIMELINE_CATEGORIES = frozenset(
     {"brief_visual_insert", "visual_departure", "sharp_stable_cut", "palette_shift"}
 )
-_SCHEMA_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
-
-
-@dataclass(frozen=True)
-class MediaMetadata:
-    filename: str
-    container: str | None
-    duration_s: float
-    size_bytes: int
-    video_codec: str | None
-    width: int | None
-    height: int | None
-    avg_frame_rate: str | None
-    fps: float | None
-    audio_present: bool
-    audio_codec: str | None
-    audio_language: str | None
-    subtitle_stream_count: int
-    subtitles_read: bool
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "filename": self.filename,
-            "container": self.container,
-            "duration_s": self.duration_s,
-            "size_bytes": self.size_bytes,
-            "video_codec": self.video_codec,
-            "width": self.width,
-            "height": self.height,
-            "avg_frame_rate": self.avg_frame_rate,
-            "fps": self.fps,
-            "audio_present": self.audio_present,
-            "audio_codec": self.audio_codec,
-            "audio_language": self.audio_language,
-            "subtitle_stream_count": self.subtitle_stream_count,
-            "subtitles_read": self.subtitles_read,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> MediaMetadata:
-        _require_false(payload, "subtitles_read")
-        return cls(
-            filename=_str(payload, "filename"),
-            container=_opt_str(payload, "container"),
-            duration_s=_float(payload, "duration_s"),
-            size_bytes=_int(payload, "size_bytes"),
-            video_codec=_opt_str(payload, "video_codec"),
-            width=_opt_int(payload, "width"),
-            height=_opt_int(payload, "height"),
-            avg_frame_rate=_opt_str(payload, "avg_frame_rate"),
-            fps=_opt_float(payload, "fps"),
-            audio_present=_bool(payload, "audio_present"),
-            audio_codec=_opt_str(payload, "audio_codec"),
-            audio_language=_opt_str(payload, "audio_language"),
-            subtitle_stream_count=_int(payload, "subtitle_stream_count"),
-            subtitles_read=False,
-        )
+_SCHEMA_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 
 
 @dataclass(frozen=True)
@@ -98,6 +42,7 @@ class Provenance:
     audio_deletes_events: bool
     ffmpeg_version: str | None
     ffprobe_version: str | None
+    video_stream_index: int
     video_threads: int
     audio_threads: int
     visual_filter: str
@@ -114,6 +59,7 @@ class Provenance:
             "audio_deletes_events": self.audio_deletes_events,
             "ffmpeg_version": self.ffmpeg_version,
             "ffprobe_version": self.ffprobe_version,
+            "video_stream_index": self.video_stream_index,
             "video_threads": self.video_threads,
             "audio_threads": self.audio_threads,
             "visual_filter": self.visual_filter,
@@ -137,6 +83,7 @@ class Provenance:
             audio_deletes_events=False,
             ffmpeg_version=_opt_str(payload, "ffmpeg_version"),
             ffprobe_version=_opt_str(payload, "ffprobe_version"),
+            video_stream_index=_stream_index(payload),
             video_threads=_int(payload, "video_threads"),
             audio_threads=_int(payload, "audio_threads"),
             visual_filter=_str(payload, "visual_filter"),
@@ -445,7 +392,6 @@ class AnalysisResult:
     """Versioned analysis of one local video file. No image bytes are included."""
 
     schema_version: str
-    media: MediaMetadata
     provenance: Provenance
     timeline: tuple[VisualEvent, ...]
     groups: tuple[EventGroup, ...]
@@ -454,7 +400,6 @@ class AnalysisResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
-            "media": self.media.to_dict(),
             "provenance": self.provenance.to_dict(),
             "timeline": [event.to_dict() for event in self.timeline],
             "groups": [group.to_dict() for group in self.groups],
@@ -471,12 +416,11 @@ class AnalysisResult:
             raise ValueError(f"unsupported schema version {version}")
         if version.split(".", 1)[0] != SCHEMA_VERSION.split(".", 1)[0]:
             raise ValueError(f"unsupported schema version {version}")
-        media = payload.get("media")
         provenance = payload.get("provenance")
         timeline = payload.get("timeline")
         groups = payload.get("groups")
-        if not isinstance(media, dict) or not isinstance(provenance, dict):
-            raise ValueError("media and provenance must be objects")
+        if not isinstance(provenance, dict):
+            raise ValueError("provenance must be an object")
         if not isinstance(timeline, list) or not isinstance(groups, list):
             raise ValueError("timeline and groups must be lists")
         diagnostics = payload.get("diagnostics")
@@ -493,7 +437,6 @@ class AnalysisResult:
             raise ValueError("group items must be objects")
         return cls(
             schema_version=version,
-            media=MediaMetadata.from_dict(media),
             provenance=Provenance.from_dict(provenance),
             timeline=tuple(VisualEvent.from_dict(item) for item in timeline_items),
             groups=tuple(EventGroup.from_dict(item) for item in group_items),
@@ -583,13 +526,11 @@ def _int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _opt_int(payload: Mapping[str, Any], key: str) -> int | None:
-    value = payload.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer or null")
-    return value
+def _stream_index(payload: Mapping[str, Any]) -> int:
+    index = _int(payload, "video_stream_index")
+    if index < 0:
+        raise ValueError("video_stream_index must be non-negative")
+    return index
 
 
 def _bool(payload: Mapping[str, Any], key: str) -> bool:

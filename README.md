@@ -11,12 +11,12 @@ It does not read subtitles, translate text, call a metadata service, or open a t
 - An audio vote on each visual event. Audio does not add or delete events
 - Optional `brief_insert_return` groups that do not remove events
 - Timeouts and cancellation while frames are still being decoded
-- JSON schema `1.0.0`, with the file name and without the absolute path
+- JSON schema `2.0.0`, with detector provenance and no source-file metadata
 
 ## Requirements
 
 - Python 3.11, 3.12, 3.13, or 3.14
-- Windows or Linux
+- Windows 10 or newer, or Linux
 - FFmpeg and FFprobe on `PATH`, or paths passed in by the caller
 
 FFmpeg is not bundled. Video decode uses two threads by default. Audio decode uses one thread. NumPy is the only required Python dependency.
@@ -40,7 +40,7 @@ for event in result.timeline:
 print(result.to_json())
 ```
 
-`analyze(path, options=None)` returns an `AnalysisResult`. `AnalysisOptions` fields are keyword-only. Detection thresholds are not caller settings. Event times lie on a 4 fps grid, so a cut can be up to 0.25 s earlier than `time_s`. The document stores the file name and does not store the absolute path.
+`analyze(path, options=None)` returns an `AnalysisResult`. `AnalysisOptions` fields are keyword-only. Detection thresholds are not caller settings. Event times lie on a 4 fps grid, so a cut can be up to 0.25 s earlier than `time_s`. The document describes detected events and includes no source-file metadata. By default, analysis uses the valid non-cover video stream with the largest pixel area, then the lowest FFprobe index. Set `AnalysisOptions(video_stream_index=2)` to select an index explicitly.
 
 ## Command line
 
@@ -54,7 +54,7 @@ Exit codes: `0` success, `2` usage or invalid options, `3` missing or unusable m
 ## Documentation
 
 - [Public API](docs/api.md)
-- [JSON schema 1.0.0](docs/schema.md)
+- [JSON schema 2.0.0](docs/schema.md)
 - [Security](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 

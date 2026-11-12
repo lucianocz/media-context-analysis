@@ -30,10 +30,10 @@ def test_wheel_and_sdist_install_cleanly(tmp_path: Path) -> None:
         names = archive.namelist()
     assert "media_context_analysis/__init__.py" in names
     assert "media_context_analysis/py.typed" in names
-    assert not any(name.endswith(".mkv") for name in names)
+    _assert_clean_members(names)
     with tarfile.open(sdists[0]) as archive:
         packaged = archive.getnames()
-    assert not any(name.endswith(".mkv") for name in packaged)
+    _assert_clean_members(packaged)
     assert any(name.endswith("README.md") for name in packaged)
     assert any(name.endswith("SECURITY.md") for name in packaged)
     assert any(name.endswith("LICENSE") for name in packaged)
@@ -47,7 +47,7 @@ def test_wheel_and_sdist_install_cleanly(tmp_path: Path) -> None:
     probe = (
         "import media_context_analysis as package; "
         "from media_context_analysis import AnalysisResult, analyze; "
-        "assert package.__version__ == '0.1.0'; "
+        "assert package.__version__ == '0.2.0'; "
         "assert callable(analyze); "
         "assert AnalysisResult.__name__ == 'AnalysisResult'"
     )
@@ -81,3 +81,12 @@ def _run(
             f"{command[0]} exited {completed.returncode}\n{completed.stdout}\n{completed.stderr}"
         )
     return completed
+
+
+def _assert_clean_members(names: list[str]) -> None:
+    forbidden_parts = {".dev", ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    forbidden_suffixes = {".mkv", ".mp4", ".webm", ".avi", ".npz", ".jpg", ".png", ".srt", ".pyc"}
+    for name in names:
+        path = Path(name)
+        assert not forbidden_parts.intersection(path.parts), name
+        assert path.suffix not in forbidden_suffixes, name

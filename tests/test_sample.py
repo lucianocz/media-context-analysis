@@ -23,12 +23,8 @@ def test_checkout_sample_when_present() -> None:
     after = {item.name for item in path.parent.iterdir()}
     assert after == before
     assert result.schema_version == SCHEMA_VERSION
-    assert result.media.filename == path.name
-    assert result.media.subtitles_read is False
-    assert result.media.audio_present is True
-    assert result.media.width == 1920
-    assert result.media.height == 1080
-    assert abs(result.media.duration_s - 167.485) < 0.05
+    assert "media" not in result.to_dict()
+    assert not hasattr(result, "media")
     assert result.provenance.detector_baseline == DETECTOR_BASELINE
     assert result.provenance.audio_deletes_events is False
     assert result.diagnostics is not None

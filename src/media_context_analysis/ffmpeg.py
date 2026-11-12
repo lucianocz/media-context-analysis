@@ -6,13 +6,14 @@ chunks, so a slow callback cannot buffer the whole file. The deadline and the
 cancel event are checked while those queues are nonempty. No image files are
 written.
 
-On Linux the child is a new session and a stop signals the process group. On
-Windows only the direct child is killed. A parent that is hard-killed from
-outside can leave that child running.
+On Linux each child owns a new session and cleanup kills its process group.
+On Windows creation atomically assigns each child to a kill-on-close Job Object.
+Incompatible enclosing Windows jobs fail closed before any child can run.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
@@ -29,6 +30,7 @@ from typing import BinaryIO, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from media_context_analysis._process import WindowsOwnedProcess
 from media_context_analysis.errors import (
     AnalysisCancelledError,
     AnalysisTimeoutError,
@@ -43,6 +45,58 @@ from media_context_analysis.signal import PcmFeatureReducer, grayscale_thumbnail
 AUDIO_THREADS = 1
 _POLL_S = 0.05
 _STREAM_QUEUE = 8
+_active: set[subprocess.Popen[bytes]] = set()
+_active_lock = threading.Lock()
+
+
+def _shutdown_processes() -> None:
+    with _active_lock:
+        processes = tuple(_active)
+    for process in processes:
+        _kill(process)
+
+
+atexit.register(_shutdown_processes)
+
+
+class _StopMonitor:
+    """Kill subprocesses even while a consumer is busy processing queued output."""
+
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        deadline: float | None,
+        cancel: threading.Event | None,
+    ) -> None:
+        self.done = threading.Event()
+        self.thread = threading.Thread(
+            target=self._watch, args=(process, deadline, cancel), daemon=True
+        )
+        with _active_lock:
+            _active.add(process)
+        try:
+            self.thread.start()
+        except BaseException:
+            with _active_lock:
+                _active.discard(process)
+            raise
+
+    def _watch(
+        self,
+        process: subprocess.Popen[bytes],
+        deadline: float | None,
+        cancel: threading.Event | None,
+    ) -> None:
+        while not self.done.wait(_POLL_S):
+            if (cancel is not None and cancel.is_set()) or (
+                deadline is not None and time.monotonic() > deadline
+            ):
+                _kill(process)
+                return
+
+    def close(self, process: subprocess.Popen[bytes]) -> None:
+        self.done.set()
+        self.thread.join(timeout=1)
 
 
 def resolve_tool(explicit: str | None, name: str) -> str:
@@ -112,26 +166,35 @@ def probe_file(
 
 def media_streams(
     probe_data: dict[str, object],
+    *,
+    video_stream_index: int | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None, int]:
-    """Return the first real video stream, the first audio stream, and the subtitle count.
+    """Select the largest usable video, first audio, and subtitle count.
 
-    Cover art (``attached_pic``) is not a video stream.
+    A usable video has a nonnegative integer FFprobe index and positive integer
+    dimensions, and is not attached cover art. Equal areas use the lowest index.
+    An explicit index must identify one of these usable video streams.
     """
     streams = probe_data.get("streams") or []
     if not isinstance(streams, list):
         raise CorruptMediaError("ffprobe JSON has no stream list")
-    video = next(
-        (
-            stream
-            for stream in streams
-            if isinstance(stream, dict)
-            and stream.get("codec_type") == "video"
-            and not _attached_picture(stream)
-        ),
-        None,
-    )
-    if video is None:
-        raise UnsupportedMediaError("no video stream")
+    videos = [stream for stream in streams if isinstance(stream, dict) and _usable_video(stream)]
+    if video_stream_index is not None:
+        video = next((stream for stream in videos if stream["index"] == video_stream_index), None)
+        if video is None:
+            raise UnsupportedMediaError(
+                f"video stream index {video_stream_index} is unavailable or is not a usable video"
+            )
+    else:
+        if not videos:
+            raise UnsupportedMediaError("no usable video stream")
+        video = min(
+            videos,
+            key=lambda stream: (
+                -cast(int, stream["width"]) * cast(int, stream["height"]),
+                cast(int, stream["index"]),
+            ),
+        )
     audio = next(
         (
             stream
@@ -146,6 +209,16 @@ def media_streams(
         if isinstance(stream, dict) and stream.get("codec_type") == "subtitle"
     )
     return video, audio if isinstance(audio, dict) else None, subtitles
+
+
+def _usable_video(stream: dict[str, object]) -> bool:
+    if stream.get("codec_type") != "video" or _attached_picture(stream):
+        return False
+    for name, minimum in (("index", 0), ("width", 1), ("height", 1)):
+        value = stream.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            return False
+    return True
 
 
 def visual_filter(params: DetectorParams) -> str:
@@ -295,12 +368,14 @@ def run_bounded(
     effective = _deadline(deadline, timeout_s)
     _raise_if_stopped(effective, cancel_event)
     process: subprocess.Popen[bytes] | None = None
+    monitor: _StopMonitor | None = None
     out_thread: threading.Thread | None = None
     err_thread: threading.Thread | None = None
     out_parts: list[bytes] = []
     err_parts: list[bytes] = []
     try:
         process = _popen(command)
+        monitor = _StopMonitor(process, effective, cancel_event)
         out_thread = threading.Thread(target=_drain, args=(process.stdout, out_parts), daemon=True)
         err_thread = threading.Thread(target=_drain, args=(process.stderr, err_parts), daemon=True)
         out_thread.start()
@@ -308,11 +383,7 @@ def run_bounded(
         _wait(process, effective, cancel_event)
     finally:
         if process is not None:
-            _stop(process)
-        if out_thread is not None:
-            out_thread.join(timeout=2.0)
-        if err_thread is not None:
-            err_thread.join(timeout=2.0)
+            _cleanup(process, monitor, out_thread, err_thread)
     assert process is not None
     return (
         int(process.returncode if process.returncode is not None else -1),
@@ -397,18 +468,19 @@ def _stream_map(stream: dict[str, object]) -> str:
 def _popen(command: list[str]) -> subprocess.Popen[bytes]:
     try:
         if sys.platform == "win32":
-            return subprocess.Popen(
+            return WindowsOwnedProcess(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                bufsize=0,
             )
         return subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            bufsize=0,
             start_new_session=True,
         )
     except FileNotFoundError as exc:
@@ -428,11 +500,13 @@ def _stream(
     _raise_if_stopped(deadline, cancel_event)
     stop = threading.Event()
     process: subprocess.Popen[bytes] | None = None
+    monitor: _StopMonitor | None = None
     out_thread: threading.Thread | None = None
     err_thread: threading.Thread | None = None
     err_parts: list[bytes] = []
     try:
         process = _popen(command)
+        monitor = _StopMonitor(process, deadline, cancel_event)
         items: queue.Queue[object] = queue.Queue(maxsize=_STREAM_QUEUE)
         assert process.stdout is not None
         assert process.stderr is not None
@@ -453,11 +527,7 @@ def _stream(
     finally:
         stop.set()
         if process is not None:
-            _stop(process)
-        if out_thread is not None:
-            out_thread.join(timeout=2.0)
-        if err_thread is not None:
-            err_thread.join(timeout=2.0)
+            _cleanup(process, monitor, out_thread, err_thread)
     assert process is not None
     return int(process.returncode if process.returncode is not None else -1), b"".join(err_parts)
 
@@ -522,7 +592,13 @@ def _read_frames(
 ) -> None:
     try:
         while not stop.is_set():
-            buffer = cast(BinaryIO, stream).read(frame_bytes)
+            pieces = bytearray()
+            while len(pieces) < frame_bytes and not stop.is_set():
+                block = cast(BinaryIO, stream).read(frame_bytes - len(pieces))
+                if not block:
+                    break
+                pieces.extend(block)
+            buffer = bytes(pieces)
             if stop.is_set():
                 return
             if len(buffer) < frame_bytes:
@@ -553,6 +629,7 @@ def _wait(
     while process.poll() is None:
         _raise_if_stopped(deadline, cancel_event, process)
         time.sleep(_POLL_S)
+    _raise_if_stopped(deadline, cancel_event, process)
 
 
 def _raise_if_stopped(
@@ -561,17 +638,14 @@ def _raise_if_stopped(
     process: subprocess.Popen[bytes] | None = None,
 ) -> None:
     if cancel_event is not None and cancel_event.is_set():
-        if process is not None:
-            _stop(process)
         raise AnalysisCancelledError("analysis cancelled")
     if deadline is not None and time.monotonic() > deadline:
-        if process is not None:
-            _stop(process)
         raise AnalysisTimeoutError("analysis timed out")
 
 
 def _kill(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+    if isinstance(process, WindowsOwnedProcess):
+        process.close_job()
         return
     if sys.platform != "win32":
         try:
@@ -579,89 +653,59 @@ def _kill(process: subprocess.Popen[bytes]) -> None:
             return
         except OSError:
             pass
-    process.kill()
+    if process.poll() is None:
+        process.kill()
 
 
-def _stop(process: subprocess.Popen[bytes]) -> None:
+def _cleanup(
+    process: subprocess.Popen[bytes],
+    monitor: _StopMonitor | None,
+    out_thread: threading.Thread | None,
+    err_thread: threading.Thread | None,
+) -> None:
+    if monitor is not None:
+        monitor.close(process)
+    try:
+        _stop(process, close_pipes=False)
+        # First let readers drain EOF, preserving bytes already written by the
+        # exited process. Closing pipes before joining could discard the tail.
+        for worker in (out_thread, err_thread):
+            if worker is not None and worker.ident is not None:
+                worker.join(timeout=2)
+    finally:
+        _close_resources(process)
+        with _active_lock:
+            _active.discard(process)
+
+
+def _stop(process: subprocess.Popen[bytes], *, close_pipes: bool = True) -> None:
+    if getattr(process, "_mca_stopped", False):
+        if close_pipes:
+            _close_resources(process)
+        return
+    setattr(process, "_mca_stopped", True)  # noqa: B010
     _kill(process)
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         _kill(process)
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             pass
+    if close_pipes:
+        _close_resources(process)
+
+
+def _close_resources(process: subprocess.Popen[bytes]) -> None:
     for stream in (process.stdout, process.stderr, process.stdin):
         if stream is not None:
             try:
                 stream.close()
             except OSError:
                 pass
-
-
-def ratio(value: object) -> float | None:
-    text = str(value or "")
-    if "/" not in text:
-        try:
-            number = float(text)
-        except ValueError:
-            return None
-        return number if number > 0 else None
-    num_text, den_text = text.split("/", 1)
-    try:
-        numerator = float(num_text)
-        denominator = float(den_text)
-    except ValueError:
-        return None
-    if denominator == 0:
-        return None
-    return numerator / denominator
-
-
-def positive_float(value: object) -> float | None:
-    if value in (None, "", "N/A") or isinstance(value, bool):
-        return None
-    if not isinstance(value, (int, float, str)):
-        return None
-    try:
-        number = float(value)
-    except ValueError:
-        return None
-    if number < 0 or number != number:
-        return None
-    return number
-
-
-def language_of(stream: dict[str, object] | None) -> str | None:
-    if stream is None:
-        return None
-    tags = stream.get("tags")
-    if not isinstance(tags, dict):
-        return None
-    language = tags.get("language")
-    if language in (None, ""):
-        return None
-    return str(language)
-
-
-def file_size(probe_data: dict[str, object], path: Path) -> int:
-    fmt = probe_data.get("format")
-    if isinstance(fmt, dict) and fmt.get("size") not in (None, "", "N/A"):
-        try:
-            return int(fmt["size"])
-        except (TypeError, ValueError):
-            pass
-    return int(path.stat().st_size)
-
-
-def container_duration(probe_data: dict[str, object], video: dict[str, object]) -> float | None:
-    fmt = probe_data.get("format")
-    for source in (fmt if isinstance(fmt, dict) else {}, video):
-        duration = positive_float(source.get("duration"))
-        if duration is not None:
-            return duration
-    return None
+    if isinstance(process, WindowsOwnedProcess):
+        process.close_process_handle()
 
 
 # Imported for tests that inspect the process table without spawning a shell.

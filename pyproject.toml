@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "media-context-analysis"
-version = "0.1.0"
+version = "0.2.0"
 description = "Timestamped visual context events for a local video file. Returns seek times, not images."
 readme = "README.md"
 license = "MIT"

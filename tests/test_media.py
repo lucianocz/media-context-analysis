@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -124,8 +127,6 @@ def test_corrupt_audio_only_and_silent(tmp_path: Path) -> None:
     silent = tmp_path / "silent.mkv"
     _video(silent, audio=False)
     result = analyze(silent, AnalysisOptions(timeout_s=60))
-    assert result.media.audio_present is False
-    assert result.media.subtitles_read is False
     assert result.provenance.subtitles_used is False
     assert result.timeline is not None
     assert all(event.scores.audio_vote == "unavailable" for event in result.timeline)
@@ -141,8 +142,6 @@ def test_analyze_is_deterministic_and_ignores_subtitle_text(clip: Path, tmp_path
     assert first.provenance.video_threads == 1
     assert first.provenance.audio_threads == 1
     assert first.provenance.detector_params["ffmpeg_threads"] == 2
-    assert first.media.audio_present is True
-    assert first.media.subtitles_read is False
     assert ".jpg" not in first.to_json()
     assert ".png" not in first.to_json()
     plain = analyze(clip, AnalysisOptions(timeout_s=60))
@@ -153,23 +152,22 @@ def test_analyze_is_deterministic_and_ignores_subtitle_text(clip: Path, tmp_path
     muxed = tmp_path / "with subs.mkv"
     _ffmpeg("-i", str(clip), "-i", str(cues), "-map", "0", "-map", "1", "-c", "copy", str(muxed))
     subtitled = analyze(muxed, AnalysisOptions(timeout_s=60))
-    assert subtitled.media.subtitle_stream_count >= 1
-    assert subtitled.media.subtitles_read is False
     assert TOKEN not in subtitled.to_json()
-    assert subtitled.media.filename == "with subs.mkv"
+    assert "with subs.mkv" not in subtitled.to_json()
+    assert plain.timeline == subtitled.timeline
+    assert "media" not in subtitled.to_dict()
 
 
 def test_unicode_path_timeout_cancel_and_tool_override(clip: Path, tmp_path: Path) -> None:
-    folder = tmp_path / "vidé o"
+    folder = tmp_path / "vidĂ© o"
     folder.mkdir()
-    target = folder / "clíp.mkv"
+    target = folder / "clĂ­p.mkv"
     shutil.copyfile(clip, target)
     found = shutil.which("ffmpeg")
     probe = shutil.which("ffprobe")
     assert found and probe
     result = analyze(target, AnalysisOptions(ffmpeg=found, ffprobe=probe, timeout_s=60))
-    assert result.media.filename == "clíp.mkv"
-    assert "path" not in result.to_dict()["media"]
+    assert "clĂ­p.mkv" not in result.to_json()
     assert result.provenance.ffmpeg_version
     with pytest.raises(FFmpegNotFoundError):
         analyze(target, AnalysisOptions(ffmpeg="media-context-analysis-missing-tool"))
@@ -190,8 +188,6 @@ def test_relative_filename_starting_with_dash(
     _video(tmp_path / "-dash.mp4", audio=False)
     monkeypatch.chdir(tmp_path)
     result = analyze(Path("-dash.mp4"), AnalysisOptions(timeout_s=60))
-    assert result.media.filename == "-dash.mp4"
-    assert "path" not in result.to_dict()["media"]
     assert result.timeline is not None
 
 
@@ -222,8 +218,6 @@ def test_short_audio_stays_unavailable_and_visual_analysis_continues(tmp_path: P
         str(path),
     )
     result = analyze(path, AnalysisOptions(timeout_s=60, include_diagnostics=True))
-    assert result.media.audio_present is True
-    assert result.media.audio_codec
     assert result.timeline is not None
     assert all(event.scores.audio_vote == "unavailable" for event in result.timeline)
     assert result.diagnostics is not None
@@ -240,6 +234,8 @@ def test_attached_picture_is_not_selected_as_video() -> None:
     real = {
         "codec_type": "video",
         "codec_name": "h264",
+        "width": 160,
+        "height": 90,
         "index": 1,
         "disposition": {"attached_pic": 0},
     }
@@ -312,9 +308,14 @@ def test_attached_cover_is_not_the_analyzed_picture(tmp_path: Path) -> None:
     selected, _audio, _subtitles = media_streams(probed)
     assert selected["codec_name"] == "h264"
     result = analyze(combined, AnalysisOptions(timeout_s=60))
-    assert result.media.video_codec == "h264"
-    assert result.media.width == 160
-    assert result.media.height == 90
+    assert result.provenance.video_stream_index == selected["index"]
+    cover_index = next(
+        stream["index"]
+        for stream in streams
+        if isinstance(stream, dict) and (stream.get("disposition") or {}).get("attached_pic") == 1
+    )
+    with pytest.raises(UnsupportedMediaError, match="not a usable video"):
+        analyze(combined, AnalysisOptions(video_stream_index=cover_index))
 
 
 def test_visual_decode_uses_the_probed_stream_index(tmp_path: Path) -> None:
@@ -362,3 +363,121 @@ def test_visual_decode_uses_the_probed_stream_index(tmp_path: Path) -> None:
     assert red["hists"].shape[0] > 0
     assert blue["hists"].shape[0] > 0
     assert not np.allclose(red["hists"][0], blue["hists"][0])
+
+
+@pytest.mark.parametrize("index", [-1, True, 1.5, "1"])
+def test_invalid_video_stream_options(index: object) -> None:
+    with pytest.raises(InvalidOptionsError, match="video_stream_index"):
+        AnalysisOptions(video_stream_index=index).validate()  # type: ignore[arg-type]
+
+
+def test_video_selection_ignores_invalid_streams_and_orders_by_area_then_index() -> None:
+    def video(index: int, width: int, height: int) -> dict[str, object]:
+        return {"codec_type": "video", "index": index, "width": width, "height": height}
+
+    candidates = [
+        video(9, 320, 180),
+        video(3, 320, 180),
+        video(0, 160, 90),
+        video(1, 0, 500),
+        video(2, 900, -1),
+        video(-1, 900, 900),
+        {"codec_type": "video", "index": 10, "width": True, "height": 900},
+        {"codec_type": "video", "index": 11, "height": 900},
+        {"codec_type": "video", "width": 900, "height": 900},
+    ]
+    probed: dict[str, object] = {"streams": candidates}
+    assert media_streams(probed)[0]["index"] == 3
+    assert media_streams(probed, video_stream_index=0)[0]["index"] == 0
+    for index in (1, 2, 10, 11, 99):
+        with pytest.raises(UnsupportedMediaError, match=f"index {index}"):
+            media_streams(probed, video_stream_index=index)
+    with pytest.raises(CorruptMediaError, match="no stream list"):
+        media_streams({"streams": "invalid"})
+
+
+@pytest.fixture(scope="module")
+def multi_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    _require_tools()
+    path = tmp_path_factory.mktemp("multi-video") / "multiple.mkv"
+    # FFmpeg's default-disposition stream is small and constant; the larger
+    # streams have a visible cut, so public events prove the decode mapping.
+    _ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=green:s=160x90:d=4:r=12",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=320x180:d=2:r=12",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:s=320x180:d=2:r=12",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=320x180:d=4:r=12",
+        "-filter_complex",
+        "[1:v][2:v]concat=n=2:v=1:a=0[cut]",
+        "-map",
+        "0:v",
+        "-map",
+        "[cut]",
+        "-map",
+        "3:v",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-disposition:v:0",
+        "default",
+        "-disposition:v:1",
+        "0",
+        "-disposition:v:2",
+        "0",
+        str(path),
+    )
+    return path
+
+
+def test_default_and_explicit_selection_decode_the_effective_video(multi_video: Path) -> None:
+    default = analyze(multi_video, AnalysisOptions(timeout_s=60, include_diagnostics=True))
+    explicit = analyze(
+        multi_video,
+        AnalysisOptions(timeout_s=60, include_diagnostics=True, video_stream_index=1),
+    )
+    assert default.provenance.video_stream_index == 1
+    assert default.to_json() == explicit.to_json()
+    assert len(default.timeline) == 1
+    assert default.timeline[0].time_s == 2.0
+    for index in (0, 2):
+        selected = analyze(multi_video, AnalysisOptions(timeout_s=60, video_stream_index=index))
+        assert selected.provenance.video_stream_index == index
+        assert selected.timeline == ()
+    with pytest.raises(UnsupportedMediaError, match="index 99"):
+        analyze(multi_video, AnalysisOptions(video_stream_index=99))
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout"])
+def test_no_success_if_stopped_during_result_assembly(
+    clip: Path, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    module = importlib.import_module("media_context_analysis.analyze")
+    assemble = module._assemble
+    cancel = threading.Event()
+    clock = time.monotonic()
+
+    def stopped_assembly(*args: object, **kwargs: object) -> object:
+        result = assemble(*args, **kwargs)
+        if stop == "cancel":
+            cancel.set()
+        else:
+            monkeypatch.setattr(module.time, "monotonic", lambda: clock + 120)
+        return result
+
+    monkeypatch.setattr(module, "_assemble", stopped_assembly)
+    error = AnalysisCancelledError if stop == "cancel" else AnalysisTimeoutError
+    with pytest.raises(error):
+        analyze(clip, AnalysisOptions(timeout_s=60, cancel_event=cancel))

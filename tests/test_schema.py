@@ -12,13 +12,12 @@ from media_context_analysis.models import (
     Diagnostics,
     EventGroup,
     EventScores,
-    MediaMetadata,
     Provenance,
     Representatives,
     VisualEvent,
 )
 
-TOP_KEYS = ["schema_version", "media", "provenance", "timeline", "groups", "diagnostics"]
+TOP_KEYS = ["schema_version", "provenance", "timeline", "groups", "diagnostics"]
 
 
 def _event(*, category: str = "sharp_stable_cut", return_time: str | None = None) -> VisualEvent:
@@ -77,26 +76,10 @@ def _event(*, category: str = "sharp_stable_cut", return_time: str | None = None
 
 def _result(diagnostics: Diagnostics | None = None) -> AnalysisResult:
     return AnalysisResult(
-        schema_version="1.0.0",
-        media=MediaMetadata(
-            filename="clip.mkv",
-            container="matroska",
-            duration_s=2.0,
-            size_bytes=12,
-            video_codec="h264",
-            width=16,
-            height=16,
-            avg_frame_rate="12/1",
-            fps=12.0,
-            audio_present=False,
-            audio_codec=None,
-            audio_language=None,
-            subtitle_stream_count=0,
-            subtitles_read=False,
-        ),
+        schema_version="2.0.0",
         provenance=Provenance(
             library_name="media-context-analysis",
-            library_version="0.1.0",
+            library_version="0.2.0",
             detector_baseline="68cc838a008ad279752bcf598e2039fcabac8be0",
             detector_note="note",
             feature_version=1,
@@ -104,6 +87,7 @@ def _result(diagnostics: Diagnostics | None = None) -> AnalysisResult:
             audio_deletes_events=False,
             ffmpeg_version=None,
             ffprobe_version=None,
+            video_stream_index=0,
             video_threads=2,
             audio_threads=1,
             visual_filter="fps=4.0,scale=96:54:flags=area",
@@ -129,24 +113,25 @@ def test_json_key_order_round_trip_and_same_major_version() -> None:
     assert list(payload) == TOP_KEYS
     text = result.to_json()
     assert text.endswith("\n")
-    assert json.loads(text)["schema_version"] == "1.0.0"
+    assert json.loads(text)["schema_version"] == "2.0.0"
     parsed = AnalysisResult.from_json(text)
     assert parsed.to_dict() == payload
     again = dict(payload)
-    again["schema_version"] = "1.9.0"
+    again["schema_version"] = "2.9.0"
     again["unused"] = {"ignored": True}
     loaded = AnalysisResult.from_dict(again)
-    assert loaded.schema_version == "1.9.0"
+    assert loaded.schema_version == "2.9.0"
     assert loaded.to_json() == AnalysisResult.from_json(loaded.to_json()).to_json()
     representatives = parsed.timeline[0].representatives.to_dict()
     assert list(representatives)[-1] == "return"
     assert "return_time" not in representatives
-    assert "path" not in parsed.media.to_dict()
+    assert not hasattr(parsed, "media")
+    assert "media" not in payload
 
 
 def test_other_schema_major_and_forced_flags_are_rejected() -> None:
     payload = _result().to_dict()
-    payload["schema_version"] = "2.0.0"
+    payload["schema_version"] = "1.0.0"
     with pytest.raises(ValueError, match="unsupported schema"):
         AnalysisResult.from_dict(payload)
     payload = _result().to_dict()
@@ -160,12 +145,6 @@ def test_other_schema_major_and_forced_flags_are_rejected() -> None:
     assert isinstance(groups, list)
     groups[0]["creates_translation_segment"] = True
     with pytest.raises(ValueError, match="creates_translation_segment"):
-        AnalysisResult.from_dict(payload)
-    payload = _result().to_dict()
-    media = payload["media"]
-    assert isinstance(media, dict)
-    media["subtitles_read"] = True
-    with pytest.raises(ValueError, match="subtitles_read"):
         AnalysisResult.from_dict(payload)
 
 
@@ -208,13 +187,13 @@ def test_diagnostics_round_trip() -> None:
 
 def test_non_finite_numbers_are_rejected() -> None:
     payload = _result().to_dict()
-    media = payload["media"]
-    assert isinstance(media, dict)
-    media["duration_s"] = float("nan")
+    timeline = payload["timeline"]
+    assert isinstance(timeline, list)
+    timeline[0]["time_s"] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         AnalysisResult.from_dict(payload)
     with pytest.raises(ValueError, match="invalid JSON number"):
-        AnalysisResult.from_json('{"schema_version": "1.0.0", "duration_s": NaN}\n')
+        AnalysisResult.from_json('{"schema_version": "2.0.0", "time_s": NaN}\n')
     counted = _result(
         Diagnostics(
             shot_count=1,
@@ -242,7 +221,18 @@ def test_non_finite_numbers_are_rejected() -> None:
 
 def test_schema_version_must_be_numeric_triple() -> None:
     payload = _result().to_dict()
-    for version in ("1", "1.0", "1.0.0-garbage", "1.x.0"):
+    for version in (
+        "2",
+        "2.0",
+        "2.0.0-garbage",
+        "2.x.0",
+        "3.0.0",
+        "02.0.0",
+        "2.01.0",
+        "2.0.00",
+        "2.0.0\n",
+        "2.\u0660.0",
+    ):
         payload["schema_version"] = version
         with pytest.raises(ValueError, match="unsupported schema"):
             AnalysisResult.from_dict(payload)
@@ -269,3 +259,27 @@ def test_null_diagnostic_counts_are_value_errors() -> None:
     diagnostics["family_counts"] = {"palette_break": None}
     with pytest.raises(ValueError, match="family_counts"):
         AnalysisResult.from_dict(payload)
+
+
+@pytest.mark.parametrize("index", [None, True, -1, 1.5, "1"])
+def test_effective_stream_index_is_required_and_non_negative(index: object) -> None:
+    payload = _result().to_dict()
+    provenance = payload["provenance"]
+    assert isinstance(provenance, dict)
+    provenance["video_stream_index"] = index
+    with pytest.raises(ValueError, match="video_stream_index"):
+        AnalysisResult.from_dict(payload)
+
+
+def test_cli_serializes_canonical_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from media_context_analysis.cli import main
+
+    result = _result()
+    monkeypatch.setattr("media_context_analysis.cli.analyze", lambda path, options: result)
+    assert main(["clip.mkv"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert list(payload) == TOP_KEYS
+    assert payload["schema_version"] == "2.0.0"
+    assert payload["provenance"]["video_stream_index"] == 0

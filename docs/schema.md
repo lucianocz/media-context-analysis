@@ -1,29 +1,24 @@
-# JSON schema 1.0.0
+# JSON schema 2.0.0
 
-`schema_version` is `MAJOR.MINOR.PATCH` of non-negative integers. Package version `0.1.0` emits schema `1.0.0`. Readers accept another `1.x.y` document and reject a different major, a shorter string, or a pre-release suffix.
+`schema_version` is `MAJOR.MINOR.PATCH` of non-negative ASCII integers without leading zeroes. Package version `0.2.0` emits schema `2.0.0`. Readers accept another `2.x.y` document and reject a different major, a shorter string, or a pre-release suffix.
 
-`to_json()` preserves this key order, uses LF line endings, and rejects non-finite numbers. There is no wall-clock field and no absolute path. A repeated run matches when the file bytes, the FFmpeg and FFprobe builds, the NumPy build, the platform, and the options match. `ffmpeg_version`, `ffprobe_version`, and `video_threads` follow that environment.
+`to_json()` preserves this key order, uses LF line endings, and rejects non-finite numbers. There is no wall-clock field or source-file metadata. A repeated run matches when the file bytes, the FFmpeg and FFprobe builds, the NumPy build, the platform, and the options match. `ffmpeg_version`, `ffprobe_version`, and `video_threads` follow that environment.
 
 ## Top level
 
 1. `schema_version` string
-2. `media` object
-3. `provenance` object
-4. `timeline` array of events
-5. `groups` array
-6. `diagnostics` object or `null`
+2. `provenance` object
+3. `timeline` array of events
+4. `groups` array
+5. `diagnostics` object or `null`
 
-## media
-
-`filename`, `container`, `duration_s`, `size_bytes`, `video_codec`, `width`, `height`, `avg_frame_rate`, `fps`, `audio_present`, `audio_codec`, `audio_language`, `subtitle_stream_count`, `subtitles_read`.
-
-`filename` is the file's name, not its directory. `subtitles_read` is always false. `subtitle_stream_count` is a count from the container probe. Subtitle text is not stored. `audio_present` is true when the container has an audio stream, including a stream too short to score.
+The former `media` object and `MediaMetadata` Python model are removed. Schema 1 documents are rejected; there is no migration layer.
 
 ## provenance
 
 `library_name` is `media-context-analysis`. `library_version` is the package version. `detector_baseline` is the detector revision recorded for this package. `detector_note` describes timestamp and grouping behavior. `feature_version` matches the detector parameters.
 
-`subtitles_used` and `audio_deletes_events` are always false. `ffmpeg_version` and `ffprobe_version` are the first line of each tool's `-version` output, or null. `video_threads` is the requested video thread count. `audio_threads` is `1`. `visual_filter` is the sample filter without `showinfo`. `detector_params` is the parameter object used for the run, including unused subtitle fields.
+`subtitles_used` and `audio_deletes_events` are always false. `ffmpeg_version` and `ffprobe_version` are the first line of each tool's `-version` output, or null. `video_stream_index` is the effective FFprobe video stream index. `video_threads` is the requested video thread count. `audio_threads` is `1`. `visual_filter` is the sample filter without `showinfo`. `detector_params` is the parameter object used for the run, including unused subtitle fields.
 
 ## timeline event
 
