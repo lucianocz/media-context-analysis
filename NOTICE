@@ -1,0 +1,11 @@
+media-context-analysis
+Copyright (c) 2026 Luciano
+
+This package is released under the MIT License. See LICENSE.
+
+NumPy is a required dependency and remains under the BSD-3-Clause License.
+Its copyright is held by the NumPy developers. This package does not vendor
+NumPy.
+
+FFmpeg and FFprobe are external programs supplied by the user. They are not
+distributed here. A particular FFmpeg build may be LGPL or GPL.

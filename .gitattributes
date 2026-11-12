@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.mkv binary
+*.mp4 binary
+*.webm binary
+*.avi binary
+*.npz binary
+*.png binary
+*.jpg binary

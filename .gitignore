@@ -1,0 +1,45 @@
+# Local media. samples/test-sample.mkv is a checkout-only file and must not be committed.
+samples/*.mkv
+samples/*.mp4
+samples/*.webm
+samples/*.avi
+*.mkv
+*.mp4
+*.webm
+*.avi
+
+# Generated review media and feature caches
+*.npz
+*.jpg
+*.jpeg
+*.png
+*.srt
+cache/
+exports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editors
+.idea/
+.vscode/
+.openidea/
+
+# Local development notes. This directory stays on disk and is not published.
+/.dev/
+

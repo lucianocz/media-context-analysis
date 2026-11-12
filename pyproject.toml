@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "media-context-analysis"
+version = "0.1.0"
+description = "Timestamped visual context events for a local video file. Returns seek times, not images."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{name = "Luciano"}]
+keywords = ["video", "ffmpeg", "scene-detection", "timeline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "mypy>=1.15",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.11",
+    "twine>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lucianocz/media-context-analysis"
+Repository = "https://github.com/lucianocz/media-context-analysis"
+Changelog = "https://github.com/lucianocz/media-context-analysis/blob/main/CHANGELOG.md"
+
+[project.scripts]
+media-context-analysis = "media_context_analysis.cli:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/media_context_analysis"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/media_context_analysis",
+    "tests",
+    "docs",
+    "samples/README.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "pyproject.toml",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "benchmarks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["media_context_analysis", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["media_context_analysis"]
+mypy_path = "src"
+strict = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not packaging and not sample'"
+markers = [
+    "packaging: build a wheel and install it in a fresh environment",
+    "sample: analyze the gitignored local sample when it is present",
+    "benchmark: compare with a local research checkout when MCA_RESEARCH_ROOT is set",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["media_context_analysis"]
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Windows 3.14 measured 84.72% branch coverage on the public tree.
+# A few FFmpeg branches move with timing; an earlier run of the same suite was 84.81%.
+# Ubuntu misses the Windows process check and covers the Unix branch instead,
+# so the enforced bar sits under that run.
+fail_under = 82
+exclude_lines = ["if __name__ == .__main__.:", "raise NotImplementedError"]
