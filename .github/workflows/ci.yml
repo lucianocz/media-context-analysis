@@ -52,7 +52,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install FFmpeg
         if: runner.os == 'Windows'
-        run: choco install ffmpeg --no-progress -y
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Find-Ffmpeg {
+            $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            return Get-ChildItem -Path C:\ProgramData\chocolatey -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          $ffmpeg = $null
+          foreach ($try in 1..3) {
+            try { & choco install ffmpeg --no-progress -y } catch { Write-Host $_ }
+            $ffmpeg = Find-Ffmpeg
+            if ($ffmpeg) { break }
+            Start-Sleep -Seconds (15 * $try)
+          }
+          if (-not $ffmpeg) {
+            $dest = Join-Path $env:RUNNER_TEMP "ffmpeg"
+            $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+            Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $dest
+            $ffmpeg = Get-ChildItem -Path $dest -Filter ffmpeg.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $ffmpeg) { throw "ffmpeg.exe was not installed" }
+          Split-Path $ffmpeg | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Check FFmpeg
         run: ffmpeg -version
       - name: Install
